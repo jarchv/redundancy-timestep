@@ -255,7 +255,7 @@ class GaussianDiffusion(nn.Module):
         self.in_resolution = ddim_config.in_resolution
         self.loss_fn = F.l1_loss
         #self.model = Unet(self.in_channels, ddim_config.hid_channels, ddim_config.channels_mult)
-        self.model = dit.DiT_B_2(args=ddim_config)
+        self.model = dit.DiT_S_2(args=ddim_config)
         # Coeficients
         # =====================================================================================
         #betas = cosine_beta_schedule(ddim_config.timesteps)
@@ -403,9 +403,6 @@ class GaussianDiffusion(nn.Module):
     @torch.no_grad()
     def ddim_sample(self, shape, clip_denoised = True):
         times = torch.linspace(0., self.num_timesteps, steps = self.sampling_timesteps + 2)[:-1]
-        #times = torch.FloatTensor([0,1,2,4,10,30,70,125,250,500])
-        #times = torch.FloatTensor([0,100,200,300,400,500,600,700,800,900])
-        #times = torch.FloatTensor([0,512,768,884,940,970,985,992,996,998])
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))
 

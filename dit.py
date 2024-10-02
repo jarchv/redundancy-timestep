@@ -82,11 +82,24 @@ class DiTBlock(nn.Module):
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_size, 6*hidden_size, bias=True))
     
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            c).chunk(6, dim=1)
+    def forward(self, x, c, train_timestep):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        #train_timestep = train_timestep.unsqueeze(1)
+        #gate_msa = torch.where(train_timestep, gate_msa, torch.ones_like(shift_msa))
+        #gate_mlp = torch.where(train_timestep, gate_mlp, torch.ones_like(shift_mlp))
+
+        # OPCION 1:
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        # OPTIONAL: OK
+        #x = x + self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        #x = x + self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        # OPTIONAL: OK
+        #x = x + gate_msa.unsqueeze(1) * self.attn(self.norm1(x))
+        #x = x + gate_mlp.unsqueeze(1) * self.mlp(self.norm2(x))
+        # OPTION 2:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 class FinalLayer(nn.Module):
@@ -98,9 +111,13 @@ class FinalLayer(nn.Module):
             nn.SiLU(), nn.Linear(hidden_size, 2*hidden_size, bias=True))
         
     def forward(self, x, c):
+        # OPCION 1
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
+        # OPCION 2
+        #x = self.norm_final(x)
+        #x = self.linear(x)
         return x
     
 class DiT(nn.Module):
@@ -158,8 +175,8 @@ class DiT(nn.Module):
         #nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        #nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        #nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
@@ -194,12 +211,13 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(x)
+        x = x + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         #y = self.y_embedder(y, self.training)    # (N, D)
         c = t# + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+            x = block(x, c, False)                      # (N, T, D)
         x = self.final_layer(x, c)               # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
