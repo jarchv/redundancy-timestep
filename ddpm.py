@@ -4,7 +4,7 @@ import math
 import torch.nn.functional as F
 import dit
 import numpy as np
-
+import utils
 from tqdm.auto import tqdm
 
 def downsample(dim_in, dim_out):
@@ -86,28 +86,25 @@ class Residual(nn.Module):
         return self.fn(x, *args, **kwargs) + x
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=8):
+    def __init__(self, dim, dim_out, groups):
         super().__init__()
-        self.conv = nn.Conv2d(dim, dim_out, 3, padding=1)
-        self.norm = nn.GroupNorm(groups, dim_out)
+        self.norm = nn.GroupNorm(groups, dim)
         self.acti = nn.GELU()
+        self.conv = nn.Conv2d(dim, dim_out, 3, padding=1)
 
-    def forward(self, x, scale_shift=None):
-        x = self.conv(x)
+    def forward(self, x):
         x = self.norm(x)
-
-        if scale_shift is not None:
-            scale, shift = scale_shift
-            x = x * (scale + 1) + shift
         x = self.acti(x)
+        x = self.conv(x)
         return x
 
 class ResNetBlock(nn.Module):
-    def __init__(self, dim, dim_out, time_emb_dim, groups=8):
+    def __init__(self, dim, dim_out, groups=8, time_emb_dim=None):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.GELU(),
-            nn.Linear(time_emb_dim, dim_out * 2))
+        if time_emb_dim is not None:
+            self.mlp1 = nn.Sequential(
+                nn.GELU(),
+                nn.Linear(time_emb_dim, dim_out))
 
         self.block1  = Block(dim, dim_out, groups=groups)
         self.block2  = Block(dim_out, dim_out, groups=groups)
@@ -117,50 +114,31 @@ class ResNetBlock(nn.Module):
         else:
             self.resconv = nn.Identity()
 
-    def forward(self, x, time_emb):
-        time_emb = self.mlp(time_emb)
-        time_emb = time_emb.view(*time_emb.shape, 1, 1)
-        scale_shift = time_emb.chunk(2, dim = 1)
+    def forward(self, x, time_emb=None):
+        h = x
+        h = self.block1(h)
+        if time_emb is not None:
+            h = h + self.mlp1(time_emb)[:, :, None, None]
         
-        h = self.block1(x, scale_shift)
         h = self.block2(h)
-
         return h + self.resconv(x)
 
-class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=4, groups=8):
         super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-
-        hidden_dim  = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, 1),
-            LayerNorm(dim)
-        )
+        self.norm = nn.GroupNorm(groups, dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
 
     def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3,dim=1)
-
-        q, k, v = map(lambda t: t.view(b, self.heads, -1, h * w), qkv)
-
-        q = torch.softmax(q, dim=-2)
-        k = torch.softmax(k, dim=-1)
-
-        q = q * self.scale
-        v = v / (h * w)
-        v = v.permute((0,1,3,2))
-        
-        context = torch.matmul(k,v)
-        context = context.permute((0,1,3,2))
-        #context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
-        
-        out = torch.matmul(context, q)
-        out = out.view(b, -1, h, w)
-        
-        return  self.to_out(out)
+        B, C, H, W = x.shape
+        h = x.reshape(B, C, H * W)
+        h = self.norm(h)
+        h = torch.transpose(h, 1, 2)
+        h = self.attn(h, h, h)[0]
+        h = torch.transpose(h, 1, 2)
+        h = h.reshape(B, C, H, W)
+        h = x + h
+        return h
 
 class WithLayerNorm(nn.Module):
     def __init__(self, dim, fn):
@@ -173,7 +151,7 @@ class WithLayerNorm(nn.Module):
         return self.fn(x)
 
 class Unet(nn.Module):
-    def __init__(self, in_channels, hid_channels, channels_mult):
+    def __init__(self, in_channels, hid_channels, channels_mult, use_time_emb=False, use_label_emb=False):
         super().__init__()
         self.in_channels  = in_channels
         self.hid_channels = hid_channels
@@ -181,12 +159,21 @@ class Unet(nn.Module):
 
         # Time embedding
         time_emb_dim = self.hid_channels * 4
-        self.time_mlp = nn.Sequential(
-            SinPosEmbedding(self.hid_channels),
-            nn.Linear(self.hid_channels, time_emb_dim),
-            nn.GELU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
-        )
+        if use_time_emb == True:
+            self.time_mlp = nn.Sequential(
+                SinPosEmbedding(self.hid_channels),
+                nn.Linear(self.hid_channels, time_emb_dim),
+                nn.GELU(),
+                nn.Linear(time_emb_dim, time_emb_dim)
+            )          
+
+        if use_label_emb == True:
+            self.label_mlp = nn.Sequential(
+                SinPosEmbedding(self.hid_channels),
+                nn.Linear(self.hid_channels, time_emb_dim),
+                nn.GELU(),
+                nn.Linear(time_emb_dim, time_emb_dim)
+            )
 
         # Conv Layers
         self.down_layers = nn.ModuleList([])
@@ -199,67 +186,85 @@ class Unet(nn.Module):
             
             self.down_layers.append(nn.ModuleList([
                 ResNetBlock(dim_in, dim_in, time_emb_dim=time_emb_dim),
-                Residual(WithLayerNorm(dim_in, LinearAttention(dim_in))),
+                Attention(dim_in),
                 downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding=1)
             ]))
 
         mid_dim = channels_mult[-1] * self.hid_channels
-        self.mid_block = ResNetBlock(mid_dim, mid_dim, time_emb_dim=time_emb_dim)
+        self.mid_block_resnet1 = ResNetBlock(mid_dim, mid_dim, time_emb_dim=time_emb_dim)
+        self.mid_block_attn   = Attention(mid_dim)
+        self.mid_block_resnet2 = ResNetBlock(mid_dim, mid_dim, time_emb_dim=time_emb_dim)
 
         for i in reversed(range(len(channels_mult) - 1)):
             dim_in  = self.hid_channels * channels_mult[i]
             dim_out = self.hid_channels * channels_mult[i + 1]
             is_last = i == 0
             self.up_layers.append(nn.ModuleList([
-                ResNetBlock(dim_out + dim_in, dim_out, time_emb_dim=time_emb_dim),
-                Residual(WithLayerNorm(dim_out, LinearAttention(dim_out))),
-                upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 3, padding=1)
+                ResNetBlock(dim_out + dim_in, dim_in, time_emb_dim=time_emb_dim),
+                Attention(dim_in),
+                upsample(dim_in, dim_in) if not is_last else Block(dim_in, self.in_channels, groups=8)
             ]))
-
-        self.final_res_block = ResNetBlock(self.hid_channels * 2, self.hid_channels, time_emb_dim=time_emb_dim)
-        self.final_conv = nn.Conv2d(self.hid_channels, self.in_channels, 1)
     
-    def forward(self, x, time):
+    def forward(self, x, time=None, y=None):
         x = self.init_conv(x)
         r = x.clone()
+        t = None
+        y = None
+        if time is not None:
+            t = self.time_mlp(time)
+        if y is not None:
+            t += self.label_mlp(y)
+        hs = []
 
-        t = self.time_mlp(time)
-        h = []
-
+        # Downsampling
         for block, attn, down in self.down_layers:
             x = block(x, t)
             x = attn(x)
-            h.append(x)
+            hs.append(x)
             x = down(x)
         
-        x = self.mid_block(x, t)
+        # Middle
+        x = self.mid_block_resnet1(x, t)
+        x = self.mid_block_attn(x)
+        x = self.mid_block_resnet2(x, t)
 
         
         for block, attn, up in self.up_layers:
-            x = torch.cat((x, h.pop()), dim = 1)
+            x = torch.cat((x, hs.pop()), dim = 1)
             x = block(x, t)
             x = attn(x)
             x = up(x)
 
-        x = torch.cat((x, r), dim=1)
-        x = self.final_res_block(x, t)
-        x = self.final_conv(x)
-
         return x
 
 class GaussianDiffusion(nn.Module):
-    def __init__(self, ddim_config, device):
+    def __init__(self, ddim_config, device, use_time_emb = False):
         super().__init__()
+        self.use_time_emb = use_time_emb
+        self.use_label_emb = (ddim_config.num_classes > 1)
+        self.num_classes = ddim_config.num_classes
         self.device = device
         self.in_channels = ddim_config.in_channels
         self.in_resolution = ddim_config.in_resolution
-        self.loss_fn = F.l1_loss
-        #self.model = Unet(self.in_channels, ddim_config.hid_channels, ddim_config.channels_mult)
-        self.model = dit.DiT_S_2(args=ddim_config)
+        self.loss_fn = F.mse_loss
+
+        ddim_config.use_time_emb = use_time_emb
+        ddim_config.use_label_emb = self.use_label_emb
+
+        self.model = dit.DiT_S_2_252(args=ddim_config).to(device)
+
+        #self.model = Unet(
+        #    in_channels = self.in_channels, hid_channels = 64, channels_mult = ddim_config.channels_mult, 
+        #    use_time_emb = self.use_time_emb, use_label_emb = (self.num_classes > 1))
+
+        model_parameters = filter(lambda p: p.requires_grad, self.model.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+
+        print(f"Number of parameters: {params}")
         # Coeficients
         # =====================================================================================
-        #betas = cosine_beta_schedule(ddim_config.timesteps)
-        betas = linear_beta_schedule(ddim_config.timesteps)
+        betas = cosine_beta_schedule(ddim_config.timesteps)
+        #betas = linear_beta_schedule(ddim_config.timesteps)
         alphas = 1. - betas
 
         alphas_cumprod = torch.cumprod(alphas, axis=0)
@@ -353,15 +358,18 @@ class GaussianDiffusion(nn.Module):
         
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t):
-        noise_pred = self.model(x, t)
+    def model_predictions(self, x, t, y=None):
+        t_input_model = t if self.use_time_emb else None
+        noise_pred = self.model(x, t_input_model, y)
         x_start = self.predict_start_from_noise(x, t, noise_pred)
 
         return noise_pred, x_start
 
-    def p_mean_variance(self, x, t, clip_denoised):
-        noise_pred, x_start = self.model_predictions(x, t)
+    def p_mean_variance(self, x, t, clip_denoised, y=None):
+        noise_pred, x_start = self.model_predictions(x, t, y)
 
+        if (t[0] < 50):
+            noise_img = torch.clamp(noise_pred, -1., 1.)
         x_start = torch.clamp(x_start, -1., 1.) if clip_denoised else x_start
 
         mean, _, log_var = self.q_posterior(x_start=x_start, x_t=x, t=t)
@@ -388,7 +396,7 @@ class GaussianDiffusion(nn.Module):
         return mean + (0.5 * log_var).exp() * z_noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape):
+    def p_sample_loop(self, shape, clip_denoised = True, label = None):
         """
             Sampling Algorithm: STEP 1,2
         """
@@ -396,17 +404,29 @@ class GaussianDiffusion(nn.Module):
         img = torch.randn(*shape, device=self.device)   
 
         # Step 2: for t = T, T-1, ..., 1 do
+        #y_classes = torch.arange(10, device=self.betas.device).unsqueeze(1)
+        #y_classes = y_classes.expand(10,5)
+        #y_classes = y_classes.contiguous().view(50,)
+
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step'):
-            img = self.p_sample(img, t)
+            img = self.p_sample(img, t, clip_denoised=clip_denoised)
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, shape, clip_denoised = True):
+    def ddim_sample(self, shape, clip_denoised = True, label = None):
         times = torch.linspace(0., self.num_timesteps, steps = self.sampling_timesteps + 2)[:-1]
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))
 
         img = torch.randn(shape, device = self.betas.device)
+
+        if self.use_label_emb == False:
+            y_classes = None
+        else:
+            if label is None:
+                y_classes = torch.randint(0, self.num_classes, (shape[0],), device=self.betas.device).long()
+            else:
+                y_classes = torch.ones((shape[0],), device=self.betas.device).long() * label
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             alpha = self.alphas_cumprod_prev[time]
@@ -415,8 +435,9 @@ class GaussianDiffusion(nn.Module):
             time_cond = torch.full(
                 (shape[0],), time, device = self.betas.device, dtype = torch.long)
 
-            pred_noise, x_start = self.model_predictions(img, time_cond)
-
+            pred_noise, x_start = self.model_predictions(img, time_cond, y_classes)
+            if (time < 50):
+                noise_img = torch.clamp(pred_noise, -1., 1.)
             if clip_denoised:
                 x_start.clamp_(-1., 1.)
 
@@ -433,9 +454,9 @@ class GaussianDiffusion(nn.Module):
         return img
 
     @torch.no_grad()
-    def sample(self, batch_size = 16):
+    def sample(self, batch_size = 50, label = None):
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, self.in_channels, self.in_resolution, self.in_resolution))
+        return sample_fn((batch_size, self.in_channels, self.in_resolution, self.in_resolution), True, label)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -462,7 +483,7 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def forward(self, img):
+    def forward(self, img, y=None):
         """
             Training Algorithm: STEP 2,3,4,5
         """
@@ -477,7 +498,9 @@ class GaussianDiffusion(nn.Module):
         x = self.q_sample(x_start = img, t = t, noise = noise)
 
         # Our model must predict noise from x_t to x_0 (Eq. 4)
-        model_out = self.model(x, t)
+        if self.use_time_emb == False:
+            t = None
+        model_out = self.model(x=x, time=t, y=y)  # It executes self.model forward(x, t, y)
         # Step 5
         loss_ = self.loss_fn(model_out, noise, reduction = 'none')
         loss = torch.mean(loss_)

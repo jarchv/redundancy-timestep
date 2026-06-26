@@ -108,7 +108,7 @@ def from_pretrained(path):
     epoch = int(path.split('-')[-1].split('.')[0])
 
     print('\nLoading "AutoEncoder@epoch[{:d}]"...'.format(epoch), end='')
-    checkpoint = torch.load(path)
+    checkpoint = torch.load(path, weights_only=False)
     args = checkpoint['args']
     state_dict = checkpoint['model']
 

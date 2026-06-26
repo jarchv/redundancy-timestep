@@ -62,8 +62,10 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_time_emb=False, use_label_emb=False, **block_kwargs):
         super().__init__()
+        self.use_time_emb = use_time_emb
+        self.use_label_emb = use_label_emb
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads, qkv_bias=True, **block_kwargs)
 
@@ -79,45 +81,44 @@ class DiTBlock(nn.Module):
             drop=0.0
         )
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 6*hidden_size, bias=True))
+        if use_time_emb == True or use_label_emb == True:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 6*hidden_size, bias=True))
     
-    def forward(self, x, c, train_timestep):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        #train_timestep = train_timestep.unsqueeze(1)
-        #gate_msa = torch.where(train_timestep, gate_msa, torch.ones_like(shift_msa))
-        #gate_mlp = torch.where(train_timestep, gate_mlp, torch.ones_like(shift_mlp))
-
+    def forward(self, x, c):
         # OPCION 1:
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        # OPTIONAL: OK
-        #x = x + self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        #x = x + self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        # OPTIONAL: OK
-        #x = x + gate_msa.unsqueeze(1) * self.attn(self.norm1(x))
-        #x = x + gate_mlp.unsqueeze(1) * self.mlp(self.norm2(x))
-        # OPTION 2:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        if self.use_time_emb == True or self.use_label_emb == True:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
+        else:
+            x = x + self.attn(self.norm1(x))
+            x = x + self.mlp(self.norm2(x))
         return x
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, use_time_emb=False, use_label_emb=False):
         super().__init__()
+        self.use_time_emb = use_time_emb
+        self.use_label_emb = use_label_emb
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2*hidden_size, bias=True))
+
+        if use_time_emb or use_label_emb:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 2*hidden_size, bias=True))
         
     def forward(self, x, c):
         # OPCION 1
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        # OPCION 2
-        #x = self.norm_final(x)
-        #x = self.linear(x)
+
+        if self.use_time_emb == True or self.use_label_emb == True:
+            shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+            x = modulate(self.norm_final(x), shift, scale)
+            x = self.linear(x)
+        else:
+            x = self.norm_final(x)
+            x = self.linear(x)
         return x
     
 class DiT(nn.Module):
@@ -130,7 +131,7 @@ class DiT(nn.Module):
         hidden_size,
         patch_size,
         num_heads,
-        args,
+        args
     ):
         super().__init__()
         self.learn_sigma = False
@@ -138,19 +139,24 @@ class DiT(nn.Module):
         self.out_channels = args.in_channels * 2 if self.learn_sigma else args.in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.use_time_emb = args.use_time_emb
+        self.use_label_emb = args.use_label_emb
 
         self.x_embedder = PatchEmbed(args.in_resolution, patch_size, args.in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        #self.y_embedder = LabelEmbedder(args.num_classes, hidden_size, args.class_dropout_prob)
-        
+
+        if self.use_label_emb == True:
+            self.y_embedder = LabelEmbedder(args.num_classes, hidden_size, args.class_dropout_prob)
+        if self.use_time_emb == True:
+            self.t_embedder = TimestepEmbedder(hidden_size)
+      
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=args.mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=args.mlp_ratio, use_time_emb=self.use_time_emb, use_label_emb=self.use_label_emb) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, use_time_emb=self.use_time_emb, use_label_emb=self.use_label_emb)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -175,17 +181,20 @@ class DiT(nn.Module):
         #nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
-        #nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        #nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        if self.use_time_emb:
+            nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        if self.use_time_emb == True or self.use_label_emb == True:
+            for block in self.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        if self.use_time_emb == True or self.use_label_emb == True:
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -204,20 +213,27 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t):
+    def forward(self, x, time, y):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        t=time
         x = self.x_embedder(x)
         x = x + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)                   # (N, D)
-        #y = self.y_embedder(y, self.training)    # (N, D)
-        c = t# + y                                # (N, D)
+        c = 0
+        if self.use_time_emb == True:
+            t_emb = self.t_embedder(t)           # (N, D)
+            c = t_emb
+        if self.use_label_emb == True:
+            c += self.y_embedder(y, self.training) # (N, D) 
+        if self.use_time_emb == False and self.use_label_emb == False:
+            c = None
+
         for block in self.blocks:
-            x = block(x, c, False)                      # (N, T, D)
+            x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)               # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
@@ -321,11 +337,11 @@ def DiT_B_8(**kwargs):
 def DiT_S_2(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
+def DiT_S_2_252(**kwargs):
+    return DiT(depth=12, hidden_size=252, patch_size=2, num_heads=6, **kwargs)
+
 def DiT_S_4(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 def DiT_S_8(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
-
-def DiT_Tiny(**kwargs):
-    return DiT(depth=4, hidden_size=384, patch_size=8, num_heads=6, **kwargs)

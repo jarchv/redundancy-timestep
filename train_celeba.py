@@ -15,6 +15,10 @@ from time import time
 from torchsummary import summary
 from diffusers import AutoencoderKL, VQModel
 
+# state 1: DiT Default
+# state 2: DiT - timestep embedder
+# state 3: U-Net Default
+# state 4: U-Net - timestep embedder
 def create_logger(directory):
     logging.basicConfig(
         filename=directory,
@@ -53,20 +57,6 @@ def create_checkpoint_dir(experiment_dir):
     
     return checkpoint_dir
 
-def load_args(args):
-    """
-    Load arguments from a checkpoint.
-    """
-    checkpoints_dir = os.path.join(
-                'results',
-                f"state-{args.state_num:03d}",
-                'checkpoints')
-    file_model = 'epoch-{:03d}.pt'.format(args.load_epoch)
-    load_path  = os.path.join(checkpoints_dir, file_model)
-    checkpoint = torch.load(load_path)
-    args = checkpoint['args']
-    return args
-
 def load_model(model, opt, state_num, load_epoch):
     print('\nLoading "model@epoch[{:d}]"...'.format(load_epoch), end='')
     checkpoints_dir = os.path.join(
@@ -76,11 +66,10 @@ def load_model(model, opt, state_num, load_epoch):
     file_model = 'epoch-{:03d}.pt'.format(load_epoch)
 
     load_path  = os.path.join(checkpoints_dir, file_model)
-    checkpoint = torch.load(load_path)
+    checkpoint = torch.load(load_path, weights_only=False)
 
     model.load_state_dict(checkpoint['model'])
     opt.load_state_dict(checkpoint['opt'])
-
     print("Done.")
     return checkpoints_dir
 
@@ -90,11 +79,6 @@ def main(args):
     torch.manual_seed(7)
     
     # Data loading
-    load_epoch = 0
-    if args.load_epoch > 0:
-        load_epoch = args.load_epoch
-        state_num  = args.state_num
-        args = load_args(args)
     train_loader, train_size = utils.get_celeb_data(args)
      
     # Logging
@@ -103,7 +87,7 @@ def main(args):
     logger.info(f"Training for {args.epochs} epochs...")
 
     # Create Model
-    model = ddpm.GaussianDiffusion(args, device).to(device)
+    model = ddpm.GaussianDiffusion(args, device, use_time_emb=True).to(device)
     opt   = torch.optim.Adam(itertools.chain(model.parameters()), lr=args.model_lr, betas=(args.beta1, 0.999))
     model = torch.compile(model)
     # VAE   
@@ -118,15 +102,18 @@ def main(args):
     
     # Checkpoint directory & Loading model
     experiment_dir = create_experiment_dir(args)
+    load_epoch = args.load_epoch
+    state_num = args.state_num
     if load_epoch == 0:
         checkpoints_dir =  create_checkpoint_dir(experiment_dir)
     else:
         checkpoints_dir = load_model(model, opt, state_num, load_epoch)
 
     # Before training
-    model.train()
+    model.eval()
     total_steps = train_size // args.batch_size
     start_time = time()
+    from calflops import calculate_flops
     for epoch in range(load_epoch + 1, args.epochs + 1):
         train_steps = 0
         log_steps   = 0
@@ -137,8 +124,13 @@ def main(args):
         for image_batch, _ in train_loader:
             x = image_batch.to(device)
             with torch.no_grad():    
-                #x = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 x = vae.encode(x).detach() / 25.0
+
+                        
+            print(f"shape: {x.shape}")
+            flops, macs, params = calculate_flops(model=model, args=[x[:1]])
+            print(f"FLOPs: {flops}, MACs: {macs}, Params: {params}")
+            return 0
             loss = model(x)
             opt.zero_grad()
             loss.backward()
@@ -149,10 +141,9 @@ def main(args):
 
             if train_steps % args.log_every == 0:
                 model.eval()
-                x_hat = model.sample(16)
+                x_hat = model.sample(50)
                 x_hat = x_hat * 25.0
                 with torch.no_grad():
-                    #x_hat = vae.decode(x_hat*(1/0.18215)).sample
                     x_hat = vae.decode(x_hat)
                     x_hat = torch.clamp(x_hat, -1, 1)
                 os.makedirs(f"{experiment_dir}/samples/", exist_ok=True)  
@@ -184,7 +175,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cuda:0', help='device')
     parser.add_argument('--in_resolution', type=int, default=16, help='image size')                      
     parser.add_argument('--in_channels', type=int, default=4, help='image channels')                    
-    parser.add_argument('--num_workers', type=int, default=0, help='number of workers')
+    parser.add_argument('--num_workers', type=int, default=4, help='number of workers')
     parser.add_argument('--imgs_path', type=str, default="../coco_train2017")
     parser.add_argument('--caps_path', type=str, default="../coco_ann2017/captions_train2017.json")
     parser.add_argument('--img_size', type=int, default=128)
@@ -193,20 +184,22 @@ if __name__ == '__main__':
     parser.add_argument('--load_epoch', type=int, default=0,help='load at "load_epoch" epoch')
     parser.add_argument('--try_num', default=1, type=int, help="try number")
     parser.add_argument('--log_path', default='train.log', help='log path')
-    parser.add_argument('--log_every', type=int, default=100, help='log after every "log_every" steps')
+    parser.add_argument('--log_every', type=int, default=500, help='log after every "log_every" steps')
     parser.add_argument('--state_num', type=int, default=0, help='state number')
 
 #   Hyperparameters
+    parser.add_argument('--num_classes', type=int, default=1, help='number of classes')
+    parser.add_argument('--class_dropout_prob', type=float, default=0.1, help='class dropout probability')
+
     parser.add_argument('--channels_mult', default=[1, 2, 4, 8], type=list, help="channels multiplier")
     parser.add_argument('--num_res_layers', type=int, default=2, help='number of residual layers')
     parser.add_argument('--timesteps', type=int, default=1000, help='timesteps')
     parser.add_argument('--eta', type=float, default=1, help='eta')
     parser.add_argument('--sampling_timesteps', type=int, default=100, help='sample steps')
-    parser.add_argument('--hid_channels', type=int, default=64, help='hidden channels')
-    parser.add_argument('--batch_size', type=int, default=128 , help='batch size')                  
+    parser.add_argument('--batch_size', type=int, default=128 , help='batch size')        # 64,NW=2, -> DiT_S,           
     parser.add_argument('--epochs', type=int, default=1000, help='number of epochs')
     parser.add_argument('--model_lr', type=float, default=1e-4, help='learning rate in rec_loss.') 
-    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')       
+    parser.add_argument('--beta1', type=float, default=0.9, help='beta1 for Adam optimizer')       
     parser.add_argument('--mlp_ratio', type=float, default=4., help='mlp ratio')
     args = parser.parse_args()
     main(args)

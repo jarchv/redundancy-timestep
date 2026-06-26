@@ -1,5 +1,12 @@
-results
-vae-models
+celeba_valid_4metrics/
+cifar10_valid_4metrics/
+eval/
+paper/
+precision_recall/
+results/
+results_model/
+vae-models/
+vgg_model/
 __pycache__
 train.log
-eval/
+create_grid.py

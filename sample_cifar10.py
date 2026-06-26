@@ -52,7 +52,7 @@ def create_checkpoint_dir(experiment_dir):
 
 def load_model(args, model, opt):
     checkpoints_dir = os.path.join(
-                'results',
+                'results/cifar10',
                 f"state-{args.state_num:03d}",
                 'checkpoints')
 
@@ -73,26 +73,24 @@ def main(args):
     torch.set_float32_matmul_precision('high')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     #torch.manual_seed(7)
-    
-    # Data loading
-    train_loader, train_size = utils.get_celeb_data(args)
-     
+         
     # Logging
     logger = create_logger(args.log_path)
-    logger.info(f"Sampling from the {args.load_epoch} epoch...")
+    logger.info("Data loaded successfully")
+    logger.info(f"Training for {args.epochs} epochs...")
 
     # Create Model
     model = ddpm.GaussianDiffusion(args, device, use_time_emb=False).to(device)
     opt   = torch.optim.Adam(itertools.chain(model.parameters()), lr=args.model_lr, betas=(args.beta1, 0.999))
     model = torch.compile(model)
     # VAE   
-    vae = autoencoder.from_pretrained(f"vae-models/checkpoints/epoch-120.pt").to(device)
+    #vae = autoencoder.from_pretrained(f"vae-models/checkpoints/epoch-120.pt").to(device)
 
     #vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
     #vae = VQModel.from_pretrained("CompVis/ldm-celebahq-256", subfolder="vqvae")
-    vae = vae.to(device)
-    vae = torch.compile(vae)
-    vae.eval()
+    #vae = vae.to(device)
+    #vae = torch.compile(vae)
+    #vae.eval()
     
     
     # Checkpoint directory & Loading model
@@ -109,11 +107,14 @@ def main(args):
     #os.makedirs(f"eval/state-{args.state_num}", exist_ok=True)  
     times = []
     for i in range(iterations):
+        class_i = i//(iterations//args.num_classes)
+        logger.info(f"Iteration {i+1}/{iterations}, class {class_i}...")
+        
         t0 = time.time()
-        x_hat = model.sample(args.batch_size)
-        x_hat = x_hat * 25.0
+        x_hat = model.sample(args.batch_size, class_i)
+        #x_hat = x_hat * 25.0
         with torch.no_grad():
-            x_hat = vae.decode(x_hat)
+            #x_hat = vae.decode(x_hat)
             x_hat = torch.clamp(x_hat, -1, 1)
             x_hat = x_hat * 0.5 + 0.5
         delta = time.time() - t0
@@ -121,21 +122,19 @@ def main(args):
         times.append(delta)
         logger.info(f"Average time {np.mean(times):.3f} and std {np.std(times):.3f} seconds")
         print(f"Average time {np.mean(times):.3f} and std {np.std(times):.3f} seconds, for {i+1}/{iterations} iterations")
-        continue
-        list_images = list(x_hat.permute(0, 2, 3, 1).detach().cpu().numpy())
-        for j, image in enumerate(list_images):
-            F.to_pil_image(image).save(f"eval/state-{args.state_num}/sample-{i}-{j}.png")
-        
+        #list_images = list(x_hat.permute(0, 2, 3, 1).detach().cpu().numpy())
+        #for j, image in enumerate(list_images):
+        #    F.to_pil_image(image).save(f"eval/state-{args.state_num}/sample-{i*args.batch_size + j +1}-class_{class_i}.png")
     
 if __name__ == '__main__':
 #   Dataset
     parser = argparse.ArgumentParser(description="Train Network")
     parser.add_argument('--root_path', default='./', help='root path for cheackpoints')
     parser.add_argument('--device', default='cuda:0', help='device')
-    parser.add_argument('--in_resolution', type=int, default=16, help='image size')                      
-    parser.add_argument('--in_channels', type=int, default=4, help='image channels')                    
-    parser.add_argument('--num_workers', type=int, default=0, help='number of workers')
-    parser.add_argument('--img_size', type=int, default=128)
+    parser.add_argument('--in_resolution', type=int, default=32, help='image size')                      
+    parser.add_argument('--in_channels', type=int, default=3, help='image channels')                    
+    parser.add_argument('--num_workers', type=int, default=4, help='number of workers')
+    parser.add_argument('--img_size', type=int, default=32)
 #   Experiments
     parser.add_argument('--ckpt_every', type=int, default=10, help='save after every "ckpt_every" epoch')
     parser.add_argument('--load_epoch', type=int, default=0,help='load at "load_epoch" epoch')
@@ -144,9 +143,10 @@ if __name__ == '__main__':
     parser.add_argument('--state_num', type=int, default=0, help='state number')
 
 #   Hyperparameters
-    parser.add_argument('--channels_mult', default=[1, 2, 4, 8], type=list, help="channels multiplier")
-    parser.add_argument('--class_dropout_prob', type=float, default=0, help='class dropout probability')
+    parser.add_argument('--num_classes', type=int, default=10, help='number of classes')
+    parser.add_argument('--class_dropout_prob', type=float, default=0.1, help='class dropout probability')
 
+    parser.add_argument('--channels_mult', default=[1, 2, 4, 8], type=list, help="channels multiplier")
     parser.add_argument('--samples', default=50000, type=int, help="number of samples")
     parser.add_argument('--timesteps', type=int, default=1000, help='timesteps')
     parser.add_argument('--sampling_timesteps', type=int, default=100, help='sample steps')
@@ -157,6 +157,6 @@ if __name__ == '__main__':
     parser.add_argument('--mlp_ratio', type=float, default=4., help='mlp ratio')
     parser.add_argument('--eta', type=float, default=1, help='eta')
     parser.add_argument('--hid_channels', type=int, default=64, help='hidden channels')
-    parser.add_argument('--num_classes', type=int, default=1, help='number of classes')
+
     args = parser.parse_args()
     main(args)

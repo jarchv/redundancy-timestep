@@ -49,6 +49,7 @@ import pathlib
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from multiprocessing import cpu_count
 
+import random
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -69,27 +70,19 @@ try:
 except ImportError:
     from .inception import InceptionV3
 
-parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-parser.add_argument('--batch-size', type=int, default=50,
-                    help='Batch size to use')
-parser.add_argument('--device', type=str, default=None,
-                    help='Device to use. Like cuda, cuda:0 or cpu')
-parser.add_argument('--dims', type=int, default=2048,
-                    choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
-                    help=('Dimensionality of Inception features to use. '
-                          'By default, uses pool3 features'))
-parser.add_argument('path', type=str, nargs=2,
-                    help=('Paths to the generated images or '
-                          'to .npz statistic files'))
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
 
+random.seed(7)
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
     https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
     """
+    if pil_image.size == (image_size, image_size):
+        return pil_image
+
     while min(*pil_image.size) >= 2 * image_size:
         pil_image = pil_image.resize(
             tuple(x // 2 for x in pil_image.size), resample=Image.BOX
@@ -168,7 +161,6 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu', resize
 
     for batch in tqdm(dataloader):
         batch = batch.to(device)
-
         with torch.no_grad():
             pred = model(batch)[0]
 
@@ -280,8 +272,10 @@ def compute_statistics_of_path(path, model, batch_size, dims, device, resize=0, 
         path = pathlib.Path(path)
         files = sorted([file for ext in IMAGE_EXTENSIONS
                        for file in path.glob('*.{}'.format(ext))])
+        
+        print(f"Found {len(files)} files in {path_str}, length: {length} ")
         if length is not None:
-            files = files[:length]
+            assert len(files) == length, f"Expected {length} files, but found {len(files)} in {path_str}"
         m, s = calculate_activation_statistics(files, model, batch_size,
                                                dims, device, resize)
     return m, s, len(files)
@@ -290,13 +284,13 @@ def compute_statistics_of_path(path, model, batch_size, dims, device, resize=0, 
 def calculate_fid_given_paths(paths, batch_size, device, dims, resize=0):
     """Calculates the FID of two paths"""
     for p in paths:
+        print(p)
         if not os.path.exists(p):
             raise RuntimeError('Invalid path: %s' % p)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
 
     model = InceptionV3([block_idx]).to(device)
-
     m1, s1, L = compute_statistics_of_path(paths[0], model, batch_size,
                                         dims, device, resize)
     m2, s2, L = compute_statistics_of_path(paths[1], model, batch_size,
@@ -309,18 +303,18 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, resize=0):
 
 
 def main():
+    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--path1', type=str, help=('Eval Path'))
+                            
+    parser.add_argument('--path2', type=str, help=('Ground Truth Path'))
     args = parser.parse_args()
+    device = torch.device('cuda' if (torch.cuda.is_available()) else 'cpu')
 
-    if args.device is None:
-        device = torch.device('cuda' if (torch.cuda.is_available()) else 'cpu')
-    else:
-        device = torch.device(args.device)
-
-    fid_value = calculate_fid_given_paths(args.path,
-                                          args.batch_size,
-                                          device,
-                                          args.dims,
-                                          resize=128)
+    fid_value = calculate_fid_given_paths([args.path1, args.path2],
+                                          batch_size=100,
+                                          device=device,
+                                          dims=2048,
+                                          resize=299)
     print('FID: ', fid_value)
 
 
