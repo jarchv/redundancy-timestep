@@ -73,12 +73,12 @@ The repository includes multiple experimental settings, including:
 - U-Net default configuration
 - U-Net with modified timestep conditioning
 
-These experiments are organized through the `state_num` argument and the corresponding result directories under [results/](results/).
+These experiments are organized through the `state_num` argument and the corresponding result directories under ```results/```.
 
 ## Notes
 
 - Training logs are written to `train.log` by default.
-- Checkpoints are saved under the experiment directory inside [results/](results/).
+- Checkpoints are saved under the experiment directory inside ```results/```.
 - The implementation is intended for research experiments and is not yet packaged as a production-ready library.
 
 ## Citation
