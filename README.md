@@ -29,7 +29,6 @@ The repository also includes evaluation and metric-related scripts for FID, Ince
 - [sample_cifar10.py](sample_cifar10.py): sampling script for CIFAR-10
 - [utils.py](utils.py): image saving, data helpers, and utilities
 - [fid_score.py](fid_score.py), [inception_score.py](inception_score.py), [precision_recall/](precision_recall/): evaluation metrics
-- [results/](results/), [results_model/](results_model/), [paper/](paper/): experiment outputs and paper-related assets
 
 ## Installation
 
